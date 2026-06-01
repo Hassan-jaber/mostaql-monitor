@@ -20,18 +20,16 @@
     "playwright": "^1.60.0",
     "winston": "^3.11.0",
     "winston-daily-rotate-file": "^4.7.1",
-    "typescript": "^5.3.3"
-  },
-  "optionalDependencies": {
-    "better-sqlite3": "^9.4.0"
-  },
-  "devDependencies": {
+    "typescript": "^5.3.3",
     "@types/better-sqlite3": "^7.6.8",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/node": "^20.11.0",
     "@types/node-cron": "^3.0.11",
     "ts-node-dev": "^2.0.0"
-    
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^9.4.0"
   }
+
 }
