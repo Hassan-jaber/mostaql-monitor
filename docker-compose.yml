@@ -1,0 +1,38 @@
+version: '3.9'
+
+services:
+  mostaql-monitor:
+    build: .
+    container_name: mostaql-monitor
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - AI_PROVIDER=${AI_PROVIDER:-claude}
+      - AI_API_KEY=${AI_API_KEY}
+      - AI_MODEL=${AI_MODEL:-claude-haiku-4-5-20251001}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_MODEL=${OPENROUTER_MODEL:-anthropic/claude-3-haiku}
+      - CHECK_INTERVAL_SECONDS=${CHECK_INTERVAL_SECONDS:-60}
+      - MIN_SCORE_THRESHOLD=${MIN_SCORE_THRESHOLD:-50}
+      - DB_PATH=/app/data/mostaql.db
+      - LOG_DIR=/app/logs
+    volumes:
+      - mostaql-data:/app/data
+      - mostaql-logs:/app/logs
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  mostaql-data:
+    driver: local
+  mostaql-logs:
+    driver: local
