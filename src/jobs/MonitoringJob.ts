@@ -35,7 +35,8 @@ export class MonitoringJob {
       await this.runCheck();
     }, ms);
 
-    if (this.timer.unref) this.timer.unref();
+    logger.info('Monitoring timer created');
+    logger.info(`Interval = ${interval}s`);
     logger.info(`✅ Monitoring started (interval: ${interval}s)`);
   }
 
