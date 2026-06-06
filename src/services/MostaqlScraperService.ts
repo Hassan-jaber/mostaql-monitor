@@ -2,169 +2,178 @@ import * as cheerio from 'cheerio';
 import { ScrapedProject } from '../modules/types';
 import { logger } from '../utils/logger';
 
+const BASE_URL = 'https://mostaql.com';
+const TARGET_URL = `${BASE_URL}/projects?category=development&budget_max=10000&sort=latest`;
+
 // ──────────────────────────────────────────────────────────────
-// MostaqlScraperService — built from the REAL HTML structure
-//
-// Confirmed from live HTML dump (mostaql-debug.html):
+// Confirmed real selectors from live HTML dump (mostaql-debug.html):
 //
 //   <tr class="project-row">
-//     <td class="row-td">
-//       <div class="card-title_wrapper">
-//         <div class="card--title">
-//           <h2 class="mrg--bt-reset">
-//             <a href="https://mostaql.com/project/1243048-slug">TITLE</a>
-//           </h2>
-//         </div>
-//       </div>
-//       <p class="text-wrapper-div project__brief">
-//         <a href="..." class="details-url">DESCRIPTION TEXT</a>
+//     <td>
+//       <h2 class="mrg--bt-reset">
+//         <a href="/project/1243048-slug">TITLE</a>
+//       </h2>
+//       <p class="project__brief">
+//         <a class="details-url" href="...">DESCRIPTION</a>
 //       </p>
 //     </td>
 //   </tr>
 //
-// Key facts:
-// - URL format: /project/NUMBER-slug  (NOT /projects/)
-// - No budget column in the list — must fetch project page for budget
-// - No skills/tags in list — only in project detail page
+// URL format: /project/NUMBER-slug  (NOT /projects/)
 // ──────────────────────────────────────────────────────────────
-
-const BASE_URL = 'https://mostaql.com';
 
 export class MostaqlScraperService {
 
   async fetchLatestProjects(): Promise<ScrapedProject[]> {
-    logger.info('📡 Fetching projects from Mostaql (browser mode)...');
+    logger.info('📡 Fetching projects from Mostaql...');
+
+    // On Hostinger: try axios first (no browser needed, lighter)
+    // On local: Playwright works fine
+    const axiosResult = await this.fetchWithAxios();
+    if (axiosResult.length > 0) return axiosResult;
+
+    // Playwright fallback (may not work on shared hosting)
+    logger.info('🌐 axios returned 0 — trying Playwright...');
+    return await this.fetchWithPlaywright();
+  }
+
+  // ── Axios (static HTML) ───────────────────────────────────
+  private async fetchWithAxios(): Promise<ScrapedProject[]> {
     try {
-      return await this.fetchWithPlaywright();
-    } catch (err: any) {
-      logger.error('Playwright fetch failed: ' + err.message);
+      const axios = (await import('axios')).default;
+      const resp = await axios.get(TARGET_URL, {
+        timeout: 20000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'ar-SA,ar;q=0.9,en-US;q=0.8',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'sec-ch-ua': '"Chromium";v="124","Google Chrome";v="124"',
+          'sec-ch-ua-platform': '"Windows"',
+          'Upgrade-Insecure-Requests': '1',
+          'Cache-Control': 'no-cache',
+        },
+        validateStatus: () => true,
+      });
+
+      if (resp.status === 403) {
+        logger.warn(`axios: 403 from Mostaql (Cloudflare blocking) — will try Playwright`);
+        return [];
+      }
+      if (resp.status !== 200) {
+        logger.warn(`axios: HTTP ${resp.status}`);
+        return [];
+      }
+
+      const projects = this.parseHTML(resp.data);
+      logger.info(`axios: parsed ${projects.length} projects`);
+      return projects;
+    } catch (e: any) {
+      logger.warn(`axios error: ${e.message}`);
       return [];
     }
   }
 
-  // ── Playwright: renders JS, waits for project rows ─────────
+  // ── Playwright (JS-rendered) ──────────────────────────────
   private async fetchWithPlaywright(): Promise<ScrapedProject[]> {
-    const { chromium } = await import('playwright');
+    let chromium: any;
+    try {
+      const pw = await import('playwright');
+      chromium = pw.chromium;
+    } catch {
+      logger.error('Playwright not available — cannot scrape JS-rendered pages');
+      return [];
+    }
 
     const browser = await chromium.launch({
       headless: true,
       args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
+        '--no-sandbox', '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage', '--disable-gpu',
         '--disable-blink-features=AutomationControlled',
       ],
     });
 
     const context = await browser.newContext({
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-        '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       locale: 'ar-SA',
       viewport: { width: 1280, height: 800 },
-      extraHTTPHeaders: {
-        'Accept-Language': 'ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7',
-      },
+      extraHTTPHeaders: { 'Accept-Language': 'ar-SA,ar;q=0.9,en-US;q=0.8' },
     });
 
     const page = await context.newPage();
-    await page.addInitScript(
-      "Object.defineProperty(navigator, 'webdriver', { get: () => undefined })"
-    );
+    await page.addInitScript("Object.defineProperty(navigator, 'webdriver', { get: () => undefined })");
 
     try {
-      logger.info('🌐 Opening browser → mostaql.com/projects');
+      const resp = await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      const status = resp?.status() ?? 0;
 
-      const response = await page.goto(`${BASE_URL}/projects?category=development&budget_max=10000&sort=latest`, {
-        waitUntil: 'domcontentloaded',
-        timeout: 45000,
-      });
-
-      const status = response?.status() ?? 0;
-      if (status === 403 || status === 429) {
-        logger.error(`❌ Mostaql returned HTTP ${status} — your IP may be blocked`);
+      if (status === 403) {
+        logger.error('Playwright: 403 from Mostaql');
         await browser.close();
         return [];
       }
 
-      // Wait for the confirmed real selector: tr.project-row
       try {
         await page.waitForSelector('tr.project-row', { timeout: 15000 });
-        logger.info('✅ tr.project-row elements found in DOM');
+        logger.info('✅ tr.project-row found in DOM');
       } catch {
-        // Try waiting a bit longer with networkidle
-        await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-        const count = await page.locator('tr.project-row').count();
-        if (count === 0) {
-          logger.warn('⚠️  tr.project-row not found — saving debug HTML');
-          const dbgHtml = await page.content();
-          require('fs').writeFileSync('./debug-latest.html', dbgHtml);
-          logger.warn('Saved to ./debug-latest.html');
-        }
+        logger.warn('tr.project-row not found after 15s');
       }
 
       const html = await page.content();
       await browser.close();
 
       const projects = this.parseHTML(html);
-      logger.info(`✅ Parsed ${projects.length} projects`);
+      logger.info(`Playwright: parsed ${projects.length} projects`);
       return projects;
 
-    } catch (err: any) {
+    } catch (e: any) {
       await browser.close();
-      throw err;
+      logger.error(`Playwright error: ${e.message}`);
+      return [];
     }
   }
 
-  // ── HTML parser using confirmed real selectors ─────────────
+  // ── HTML parser — confirmed real selectors ─────────────────
   parseHTML(html: string): ScrapedProject[] {
     const $ = cheerio.load(html);
     const projects: ScrapedProject[] = [];
     const seen = new Set<string>();
 
-    // CONFIRMED SELECTOR: tr.project-row
     $('tr.project-row').each((_, el) => {
       const $row = $(el);
 
-      // ── Title ──────────────────────────────────────────────
-      // CONFIRMED: h2.mrg--bt-reset > a
-      const $titleLink = $row.find('h2.mrg--bt-reset a').first();
-      const title = $titleLink.text().trim();
+      // Title: h2.mrg--bt-reset > a
+      const $link = $row.find('h2.mrg--bt-reset a').first();
+      const title = $link.text().trim();
       if (!title || title.length < 3) return;
 
-      // ── URL ────────────────────────────────────────────────
-      // CONFIRMED: href="https://mostaql.com/project/NUMBER-slug"
-      const href = $titleLink.attr('href') || '';
-      if (!href.includes('/project/')) return; // skip "مشروع مماثل" links
+      // URL must contain /project/ (singular)
+      const href = $link.attr('href') || '';
+      if (!href.includes('/project/')) return;
 
       const url = href.startsWith('http') ? href : `${BASE_URL}${href}`;
 
-      // ── Project ID ─────────────────────────────────────────
-      // CONFIRMED: /project/1243048-slug → ID = 1243048
+      // ID from URL: /project/1243048-slug → 1243048
       const idMatch = url.match(/\/project\/(\d+)/);
       const projectId = idMatch ? idMatch[1] : this.hashId(url);
 
       if (seen.has(projectId)) return;
       seen.add(projectId);
 
-      // ── Description ────────────────────────────────────────
-      // CONFIRMED: p.project__brief a.details-url
-      const $brief = $row.find('p.project__brief a.details-url').first();
-      const description = $brief.text().trim().slice(0, 600);
+      // Description: p.project__brief a.details-url
+      const description = $row.find('p.project__brief a.details-url').first().text().trim().slice(0, 600)
+        || $row.find('.text-wrapper-div a').first().text().trim().slice(0, 600);
 
-      // Also try the text-wrapper-div variant
-      const $briefAlt = $row.find('.text-wrapper-div a').first();
-      const finalDescription = description || $briefAlt.text().trim().slice(0, 600);
-
-      // ── Time posted ────────────────────────────────────────
-      const posted_at = $row.find('time').attr('datetime') || undefined;
+      const posted_at = $row.find('time').attr('datetime');
 
       projects.push({
         project_id: projectId,
         title,
         url,
-        budget: 'غير محدد', // Budget not in list — fetched separately if needed
-        description: finalDescription,
+        budget: 'غير محدد',
+        description,
         skills: [],
         posted_at,
       });
@@ -173,58 +182,19 @@ export class MostaqlScraperService {
     return projects;
   }
 
-  // ── Fetch individual project page for budget + skills ──────
   async fetchProjectDetails(url: string): Promise<Partial<ScrapedProject>> {
     try {
       const axios = (await import('axios')).default;
       const resp = await axios.get(url, {
         timeout: 15000,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
-          'Accept-Language': 'ar-SA,ar;q=0.9',
-        },
+        headers: { 'User-Agent': 'Mozilla/5.0 Chrome/124.0.0.0' },
         validateStatus: () => true,
       });
-
       if (resp.status !== 200) return {};
-
       const $ = cheerio.load(resp.data);
-
-      // Budget — several possible locations on project detail page
-      const budgetSelectors = [
-        '.budget-box strong',
-        '.budget-box',
-        '[class*="budget"]',
-        '[class*="price"]',
-        '.crl-budget',
-        'span.budget',
-      ];
-      let budget = '';
-      for (const sel of budgetSelectors) {
-        const t = $(sel).first().text().trim();
-        if (t && t.length < 80) { budget = t; break; }
-      }
-
-      // Skills
-      const skills: string[] = [];
-      $('[class*="skill"] a, [class*="tag"] a, .badge').each((_, el) => {
-        const t = $(el).text().trim();
-        if (t && t.length < 80 && t.length > 1) skills.push(t);
-      });
-
-      // Full description from detail page
-      const fullDesc = $(
-        '.project-description, [itemprop="description"], .project__description'
-      ).first().text().trim().slice(0, 1000);
-
-      return {
-        budget: budget || undefined,
-        skills: skills.length ? skills : undefined,
-        description: fullDesc || undefined,
-      };
-    } catch {
-      return {};
-    }
+      const description = $('.project-description, [itemprop="description"]').first().text().trim().slice(0, 1000);
+      return { description: description || undefined };
+    } catch { return {}; }
   }
 
   private hashId(input: string): string {

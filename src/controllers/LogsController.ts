@@ -12,10 +12,7 @@ logsRouter.get('/', (req: Request, res: Response, next: NextFunction) => {
     if (level) { conds.push('level = ?'); params.push(level); }
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
     const offset = (parseInt(page) - 1) * parseInt(limit);
-
-    const countRow = Database.getInstance().queryOne<any>(
-      `SELECT COUNT(*) as cnt FROM system_logs ${where}`, params
-    );
+    const countRow = Database.getInstance().queryOne<any>(`SELECT COUNT(*) as cnt FROM system_logs ${where}`, params);
     const total = Number(countRow?.cnt ?? countRow?.['COUNT(*)'] ?? 0);
     const data = Database.getInstance().queryAll(
       `SELECT * FROM system_logs ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
@@ -27,9 +24,7 @@ logsRouter.get('/', (req: Request, res: Response, next: NextFunction) => {
 
 logsRouter.delete('/', (_req, res, next) => {
   try {
-    Database.getInstance().run(
-      `DELETE FROM system_logs WHERE created_at < datetime('now', '-7 days')`
-    );
+    Database.getInstance().run(`DELETE FROM system_logs WHERE created_at < datetime('now', '-7 days')`);
     res.json({ success: true });
   } catch (e) { next(e); }
 });

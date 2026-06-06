@@ -5,15 +5,6 @@ import { ProjectRepository } from '../repositories/ProjectRepository';
 import { Database } from '../database/Database';
 import { logger } from '../utils/logger';
 
-// ──────────────────────────────────────────────────────────────
-// MonitoringJob
-//
-// Flow: Scrape → Filter new → Keyword match → Save → Notify
-// No AI. Notifications fire immediately on keyword match.
-//
-// DB reset command: if a file "RESET_DB" exists in working dir,
-// clears all projects so they get re-evaluated.
-// ──────────────────────────────────────────────────────────────
 export class MonitoringJob {
   private scraper = new MostaqlScraperService();
   private matcher = new KeywordMatcherService();
@@ -26,15 +17,19 @@ export class MonitoringJob {
     const interval = this.getInterval();
     logger.info(`⏱  Monitoring every ${interval}s`);
 
-    // Run immediately
+    // Run first check immediately
     await this.runCheck();
 
     const ms = interval * 1000;
     this.timer = setInterval(async () => {
-      if (this.isRunning) { logger.debug('⏭  Skipping — previous check still running'); return; }
+      if (this.isRunning) {
+        logger.debug('⏭  Skipping — previous check still running');
+        return;
+      }
       await this.runCheck();
     }, ms);
 
+    // DO NOT call timer.unref() — process must stay alive on Hostinger
     logger.info('Monitoring timer created');
     logger.info(`Interval = ${interval}s`);
     logger.info(`✅ Monitoring started (interval: ${interval}s)`);
@@ -50,11 +45,16 @@ export class MonitoringJob {
     this.isRunning = true;
 
     try {
-      // Check pause state
-      const active = Database.getInstance().queryOne<{ value: string }>(
-        "SELECT value FROM settings WHERE key = 'monitoring_active'"
-      );
-      if (active?.value === 'false') {
+      // Check if monitoring is paused
+      let isActive = true;
+      try {
+        const row = Database.getInstance().queryOne<{ value: string }>(
+          "SELECT value FROM settings WHERE key = 'monitoring_active'"
+        );
+        isActive = row?.value !== 'false';
+      } catch { /* DB unavailable — keep running */ }
+
+      if (!isActive) {
         logger.debug('⏸  Monitoring paused');
         return;
       }
@@ -62,8 +62,9 @@ export class MonitoringJob {
       logger.info('🔍 Checking Mostaql for new projects...');
 
       const projects = await this.scraper.fetchLatestProjects();
+
       if (projects.length === 0) {
-        logger.warn('⚠️  0 projects returned — scraping may be blocked');
+        logger.warn('⚠️  0 projects returned — Mostaql may be blocking scraping');
         return;
       }
 
@@ -72,15 +73,36 @@ export class MonitoringJob {
       let notifiedCount = 0;
 
       for (const project of projects) {
-        // Skip already processed
-        if (this.repo.exists(project.project_id)) continue;
+        // Skip already in DB
+        let alreadyExists = false;
+        try { alreadyExists = this.repo.exists(project.project_id); } catch { /* DB error */ }
+        if (alreadyExists) continue;
         newCount++;
 
-        // ── Keyword match ─────────────────────────────────────
+        // Keyword match (title only)
         const { matched, keywords } = this.matcher.matchProject(project);
 
         if (!matched) {
-          // Save as no_match so we don't recheck
+          try {
+            this.repo.save({
+              project_id: project.project_id,
+              title: project.title,
+              url: project.url,
+              budget: project.budget || 'غير محدد',
+              description: project.description || '',
+              skills: JSON.stringify(project.skills || []),
+              classification: 'no_match',
+              reason: 'No keywords matched',
+              matched_keywords: '[]',
+            });
+          } catch { /* ignore DB write failure */ }
+          continue;
+        }
+
+        matchedCount++;
+
+        // Save to DB
+        try {
           this.repo.save({
             project_id: project.project_id,
             title: project.title,
@@ -88,111 +110,79 @@ export class MonitoringJob {
             budget: project.budget || 'غير محدد',
             description: project.description || '',
             skills: JSON.stringify(project.skills || []),
-            classification: 'no_match',
-            reason: 'No keywords matched',
-            matched_keywords: '[]',
+            classification: 'matched',
+            reason: `Matched: ${keywords.join(', ')}`,
+            matched_keywords: JSON.stringify(keywords),
           });
-          continue;
-        }
+        } catch { /* ignore */ }
 
-        matchedCount++;
-
-        // ── Save to DB ────────────────────────────────────────
-        this.repo.save({
-          project_id: project.project_id,
-          title: project.title,
-          url: project.url,
-          budget: project.budget || 'غير محدد',
-          description: project.description || '',
-          skills: JSON.stringify(project.skills || []),
-          classification: 'matched',
-          reason: `Matched: ${keywords.join(', ')}`,
-          matched_keywords: JSON.stringify(keywords),
-        });
-
-        // ── Send Telegram notification immediately ────────────
+        // Send Telegram notification — this is the critical step
         const sent = await this.telegram.sendMatchNotification(project, keywords);
         if (sent) notifiedCount++;
 
-        // DB log
-        this.dbLog('info', 'matching', `Matched: ${project.title}`, { keywords, sent });
+        try {
+          Database.getInstance().run(
+            'INSERT INTO system_logs (level, category, message, metadata) VALUES (?, ?, ?, ?)',
+            ['info', 'matching', `Matched: ${project.title}`, JSON.stringify({ keywords, sent })]
+          );
+        } catch { /* ignore */ }
       }
 
-      logger.info(
-        `📊 Check done — scanned: ${projects.length}, new: ${newCount}, matched: ${matchedCount}, notified: ${notifiedCount}`
-      );
+      logger.info(`📊 Check done — scanned: ${projects.length}, new: ${newCount}, matched: ${matchedCount}, notified: ${notifiedCount}`);
 
     } catch (err: any) {
       logger.error('❌ MonitoringJob error: ' + err.message);
-      this.dbLog('error', 'monitoring', err.message);
     } finally {
       this.isRunning = false;
     }
   }
 
-  // ── Re-evaluate all no_match projects (run once after fix) ──
   async reEvaluateOldProjects(): Promise<void> {
     logger.info('🔄 Re-evaluating old no_match projects...');
-
-    const old = Database.getInstance().queryAll<{
-      project_id: string; title: string; url: string;
-      budget: string; description: string; skills: string;
-    }>(
-      "SELECT project_id, title, url, budget, description, skills FROM projects WHERE classification = 'no_match'"
-    );
+    let old: any[] = [];
+    try {
+      old = Database.getInstance().queryAll(
+        "SELECT project_id, title, url, budget, description, skills FROM projects WHERE classification = 'no_match'"
+      );
+    } catch { logger.warn('Cannot read DB for re-evaluation'); return; }
 
     logger.info(`Found ${old.length} no_match projects to re-evaluate`);
-    let matched = 0;
-    let notified = 0;
+    let matched = 0, notified = 0;
 
     for (const row of old) {
       const project = {
-        project_id: row.project_id,
-        title: row.title,
-        url: row.url,
-        budget: row.budget,
-        description: row.description,
-        skills: this.parseJsonArray(row.skills),
+        project_id: row.project_id, title: row.title, url: row.url,
+        budget: row.budget, description: row.description,
+        skills: (() => { try { return JSON.parse(row.skills) || []; } catch { return []; } })(),
       };
 
       const { matched: isMatch, keywords } = this.matcher.matchProject(project);
       if (!isMatch) continue;
-
       matched++;
       logger.info(`🔄 Re-matched: "${project.title}" → [${keywords.join(', ')}]`);
 
-      // Update DB
-      Database.getInstance().run(
-        "UPDATE projects SET classification = 'matched', reason = ?, matched_keywords = ? WHERE project_id = ?",
-        [`Re-matched: ${keywords.join(', ')}`, JSON.stringify(keywords), project.project_id]
-      );
+      try {
+        Database.getInstance().run(
+          "UPDATE projects SET classification = 'matched', reason = ?, matched_keywords = ? WHERE project_id = ?",
+          [`Re-matched: ${keywords.join(', ')}`, JSON.stringify(keywords), project.project_id]
+        );
+      } catch { /* ignore */ }
 
-      // Send notification
       const sent = await this.telegram.sendMatchNotification(project, keywords);
       if (sent) notified++;
     }
 
-    logger.info(`✅ Re-evaluation done — matched: ${matched}, notified: ${notified}`);
-  }
-
-  private parseJsonArray(json: string): string[] {
-    try { return JSON.parse(json) || []; } catch { return []; }
+    logger.info(`✅ Re-evaluation done — re-matched: ${matched}, notified: ${notified}`);
   }
 
   private getInterval(): number {
-    const row = Database.getInstance().queryOne<{ value: string }>(
-      "SELECT value FROM settings WHERE key = 'check_interval'"
-    );
-    const val = parseInt(row?.value || '60', 10);
-    return isNaN(val) || val < 10 ? 60 : val;
-  }
-
-  private dbLog(level: string, category: string, message: string, meta?: object): void {
+    let val = parseInt(process.env.CHECK_INTERVAL_SECONDS || '60', 10);
     try {
-      Database.getInstance().run(
-        'INSERT INTO system_logs (level, category, message, metadata) VALUES (?, ?, ?, ?)',
-        [level, category, message, meta ? JSON.stringify(meta) : null]
+      const row = Database.getInstance().queryOne<{ value: string }>(
+        "SELECT value FROM settings WHERE key = 'check_interval'"
       );
-    } catch { /* non-critical */ }
+      if (row?.value) val = parseInt(row.value, 10);
+    } catch { /* use env var */ }
+    return isNaN(val) || val < 10 ? 60 : val;
   }
 }

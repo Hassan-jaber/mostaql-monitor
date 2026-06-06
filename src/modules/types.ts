@@ -23,14 +23,6 @@ export interface ProjectRecord {
   sent_at: string | null;
 }
 
-export interface NotificationRecord {
-  id: number;
-  project_id: string;
-  telegram_status: 'pending' | 'sent' | 'failed';
-  error_message: string | null;
-  sent_at: string;
-}
-
 export interface ProjectFilter {
   search?: string;
   classification?: string;

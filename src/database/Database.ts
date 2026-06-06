@@ -3,26 +3,26 @@ import fs from 'fs';
 import { AppConfig } from '../config/AppConfig';
 import { logger } from '../utils/logger';
 
-// We use better-sqlite3 if available, fall back to a file-based JSON store
-// so the app always starts. On Windows without build tools, we use a pure-JS SQLite.
-let BetterSqlite: any;
-try {
-  BetterSqlite = require('better-sqlite3');
-} catch {
-  BetterSqlite = null;
-}
+// ──────────────────────────────────────────────────────────────
+// Database — dual backend
+// 1. Tries better-sqlite3 (native, fast)
+// 2. Falls back to JSON file store (zero dependencies)
+//
+// Either way the app runs. SQLite failure is NOT fatal.
+// ──────────────────────────────────────────────────────────────
 
-// ──────────────────────────────────────────────────────────────
-// Tiny JSON-based fallback (no native modules needed)
-// ──────────────────────────────────────────────────────────────
+let BetterSqlite: any = null;
+try { BetterSqlite = require('better-sqlite3'); } catch { /* not available */ }
+
+// ── JSON fallback store ────────────────────────────────────────
 class JsonStore {
   private data: Record<string, any[]> = {
-    projects: [], notifications: [], settings: [], system_logs: []
+    projects: [], notifications: [], settings: [], system_logs: [],
   };
-  private filePath: string;
+  readonly filePath: string;
 
-  constructor(filePath: string) {
-    this.filePath = filePath.replace('.db', '.json');
+  constructor(dbPath: string) {
+    this.filePath = dbPath.replace(/\.db$/, '.json');
     this.load();
   }
 
@@ -35,7 +35,8 @@ class JsonStore {
   }
 
   save() {
-    fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
+    try { fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2)); }
+    catch { /* read-only fs */ }
   }
 
   table(name: string): any[] {
@@ -49,9 +50,7 @@ class JsonStore {
   }
 }
 
-// ──────────────────────────────────────────────────────────────
-// Unified Database wrapper
-// ──────────────────────────────────────────────────────────────
+// ── Unified Database class ─────────────────────────────────────
 export class Database {
   private static instance: Database;
   private sqliteDb: any = null;
@@ -68,30 +67,38 @@ export class Database {
   async initialize(): Promise<void> {
     const dbPath = path.resolve(AppConfig.dbPath);
     const dbDir = path.dirname(dbPath);
-    if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
 
+    // Ensure data directory exists
+    try {
+      if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
+    } catch (e: any) {
+      logger.warn(`Cannot create data dir ${dbDir}: ${e.message}`);
+    }
+
+    // Try SQLite first
     if (BetterSqlite) {
       try {
         this.sqliteDb = new BetterSqlite(dbPath);
         this.sqliteDb.pragma('journal_mode = WAL');
         this.sqliteDb.pragma('foreign_keys = ON');
         this.createSqliteTables();
-        this.seedDefaultSettings();
+        this.seedSettings();
         this.useSqlite = true;
-        logger.info(`SQLite database initialized at ${dbPath}`);
+        logger.info(`✅ SQLite initialized: ${dbPath}`);
         return;
-      } catch (e) {
-        logger.warn('better-sqlite3 failed, falling back to JSON store: ' + (e as Error).message);
+      } catch (e: any) {
+        logger.warn(`SQLite failed (${e.message}), falling back to JSON store`);
+        this.sqliteDb = null;
       }
     }
 
-    // Fallback to JSON store
+    // JSON fallback
     this.jsonStore = new JsonStore(dbPath);
     this.seedJsonSettings();
-    logger.info(`JSON store initialized at ${dbPath.replace('.db', '.json')}`);
+    logger.info(`✅ JSON store initialized: ${this.jsonStore.filePath}`);
   }
 
-  // ── Public query API (works for both backends) ─────────────
+  // ── Public API ─────────────────────────────────────────────
 
   run(sql: string, params: any[] = []): void {
     if (this.useSqlite) {
@@ -112,10 +119,9 @@ export class Database {
     return this.jsonQuery<T>(sql, params);
   }
 
-  // Keep legacy getDb() for any leftover callers — returns a shim
+  // Legacy shim for any code using getDb()
   getDb(): any {
     if (this.useSqlite) return this.sqliteDb;
-    // Return a shim that delegates to our methods
     const self = this;
     return {
       prepare: (sql: string) => ({
@@ -126,12 +132,16 @@ export class Database {
     };
   }
 
+  isReady(): boolean {
+    return this.useSqlite || this.jsonStore !== null;
+  }
+
   close(): void {
     if (this.useSqlite && this.sqliteDb) this.sqliteDb.close();
     if (this.jsonStore) this.jsonStore.save();
   }
 
-  // ── SQLite implementation ──────────────────────────────────
+  // ── SQLite schema ──────────────────────────────────────────
 
   private createSqliteTables(): void {
     this.sqliteDb.exec(`
@@ -169,35 +179,34 @@ export class Database {
         metadata TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
-      CREATE INDEX IF NOT EXISTS idx_projects_created_at ON projects(created_at);
-      CREATE INDEX IF NOT EXISTS idx_projects_classification ON projects(classification);
+      CREATE INDEX IF NOT EXISTS idx_projects_created ON projects(created_at);
+      CREATE INDEX IF NOT EXISTS idx_projects_class ON projects(classification);
     `);
   }
 
-  private seedDefaultSettings(): void {
+  private seedSettings(): void {
+    // Seed from env vars — DB stores a copy for the settings UI
     const defaults = [
-      ['telegram_bot_token', AppConfig.telegram.botToken || ''],
-      ['telegram_chat_id', AppConfig.telegram.chatId || ''],
-      ['check_interval', AppConfig.monitoring.checkIntervalSeconds.toString()],
-      ['min_score', '0'],
+      ['telegram_bot_token', process.env.TELEGRAM_BOT_TOKEN || ''],
+      ['telegram_chat_id', process.env.TELEGRAM_CHAT_ID || ''],
+      ['check_interval', process.env.CHECK_INTERVAL_SECONDS || '60'],
       ['monitoring_active', 'true'],
     ];
     const stmt = this.sqliteDb.prepare(
-      `INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`
+      'INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)'
     );
     for (const [k, v] of defaults) stmt.run(k, v);
   }
 
-  // ── JSON fallback implementation ───────────────────────────
+  // ── JSON fallback ──────────────────────────────────────────
 
   private seedJsonSettings(): void {
     const store = this.jsonStore!;
     const settings = store.table('settings');
     const defaults = [
-      ['telegram_bot_token', AppConfig.telegram.botToken || ''],
-      ['telegram_chat_id', AppConfig.telegram.chatId || ''],
-      ['check_interval', AppConfig.monitoring.checkIntervalSeconds.toString()],
-      ['min_score', '0'],
+      ['telegram_bot_token', process.env.TELEGRAM_BOT_TOKEN || ''],
+      ['telegram_chat_id', process.env.TELEGRAM_CHAT_ID || ''],
+      ['check_interval', process.env.CHECK_INTERVAL_SECONDS || '60'],
       ['monitoring_active', 'true'],
     ];
     for (const [key, value] of defaults) {
@@ -212,10 +221,9 @@ export class Database {
     const store = this.jsonStore!;
     const s = sql.trim().toUpperCase();
 
-    if (s.startsWith('INSERT OR IGNORE INTO PROJECTS')) {
+    if (s.startsWith('INSERT OR IGNORE INTO PROJECTS') || s.startsWith('INSERT INTO PROJECTS')) {
       const t = store.table('projects');
-      const pid = params[0];
-      if (t.find((r: any) => r.project_id === pid)) return;
+      if (t.find((r: any) => r.project_id === params[0])) return;
       t.push({
         id: store.nextId('projects'),
         project_id: params[0], title: params[1], url: params[2],
@@ -224,41 +232,30 @@ export class Database {
         matched_keywords: params[8] || '[]',
         created_at: new Date().toISOString(), sent_at: null,
       });
-    } else if (s.startsWith('INSERT OR IGNORE INTO SETTINGS') || s.startsWith('INSERT OR REPLACE INTO SETTINGS')) {
+    } else if (s.includes('INSERT') && s.includes('SETTINGS')) {
       const t = store.table('settings');
       const key = params[0];
       const idx = t.findIndex((r: any) => r.key === key);
       const rec = { key, value: params[1], updated_at: new Date().toISOString() };
       if (idx >= 0) t[idx] = rec; else t.push(rec);
     } else if (s.startsWith('INSERT INTO NOTIFICATIONS')) {
-      const t = store.table('notifications');
-      t.push({
+      store.table('notifications').push({
         id: store.nextId('notifications'),
         project_id: params[0], telegram_status: params[1],
         error_message: params[2] || null, sent_at: new Date().toISOString(),
       });
-    } else if (s.startsWith('UPDATE PROJECTS SET CLASSIFICATION')) {
-      const t = store.table('projects');
-      const projectId = params[params.length - 1]; // last param is project_id
-      const row = t.find((r: any) => r.project_id === projectId);
-      if (row) {
-        row.classification = params[0];
-        row.reason = params[1];
-        row.matched_keywords = params[2];
-      }
     } else if (s.startsWith('UPDATE PROJECTS SET SENT_AT')) {
-      const t = store.table('projects');
-      const row = t.find((r: any) => r.project_id === params[0]);
+      const row = store.table('projects').find((r: any) => r.project_id === params[0]);
       if (row) row.sent_at = new Date().toISOString();
+    } else if (s.startsWith('UPDATE PROJECTS SET CLASSIFICATION')) {
+      const row = store.table('projects').find((r: any) => r.project_id === params[params.length - 1]);
+      if (row) { row.classification = params[0]; row.reason = params[1]; row.matched_keywords = params[2]; }
+    } else if (s.startsWith('DELETE FROM SYSTEM_LOGS')) {
+      store.table('system_logs').splice(0);
     } else if (s.startsWith('INSERT INTO SYSTEM_LOGS')) {
       const t = store.table('system_logs');
-      t.push({
-        id: store.nextId('system_logs'),
-        level: params[0], category: params[1], message: params[2],
-        metadata: params[3] || null, created_at: new Date().toISOString(),
-      });
-      // Keep only last 1000 logs
-      if (t.length > 1000) t.splice(0, t.length - 1000);
+      t.push({ id: store.nextId('system_logs'), level: params[0], category: params[1], message: params[2], metadata: params[3] || null, created_at: new Date().toISOString() });
+      if (t.length > 500) t.splice(0, t.length - 500);
     }
 
     store.save();
@@ -268,61 +265,31 @@ export class Database {
     const store = this.jsonStore!;
     const s = sql.trim().toUpperCase();
 
-    if (s.includes('FROM PROJECTS WHERE PROJECT_ID = ?')) {
-      return store.table('projects').filter((r: any) => r.project_id === params[0]) as T[];
-    }
-    if (s.includes('FROM PROJECTS') && s.includes('SELECT ID')) {
-      return store.table('projects').filter((r: any) => r.project_id === params[0]) as T[];
-    }
-    if (s.includes('FROM SETTINGS WHERE KEY = ?') || s.includes("WHERE KEY = ?")) {
+    if (s.includes('FROM SETTINGS WHERE KEY = ?') || (s.includes('FROM SETTINGS') && s.includes('WHERE'))) {
       return store.table('settings').filter((r: any) => r.key === params[0]) as T[];
     }
-    if (s.includes('FROM SETTINGS')) {
-      return store.table('settings') as T[];
-    }
+    if (s.includes('FROM SETTINGS')) return store.table('settings') as T[];
+
     if (s.includes('FROM PROJECTS') && s.includes('COUNT(*)')) {
-      return [{ 'COUNT(*)': store.table('projects').length }] as T[];
+      return [{ cnt: store.table('projects').length }] as T[];
+    }
+    if (s.includes('FROM PROJECTS WHERE PROJECT_ID = ?') || (s.includes('FROM PROJECTS') && s.includes('WHERE PROJECT_ID'))) {
+      return store.table('projects').filter((r: any) => r.project_id === params[0]) as T[];
     }
     if (s.includes('FROM PROJECTS')) {
       let rows = [...store.table('projects')];
-      // Apply simple filters
-      if (params.length > 0 && s.includes('WHERE')) {
-        // search filter
-        if (s.includes('LIKE')) {
-          const term = (params[0] as string).replace(/%/g, '').toLowerCase();
-          rows = rows.filter((r: any) =>
-            r.title?.toLowerCase().includes(term) || r.description?.toLowerCase().includes(term)
-          );
-        }
-        // classification filter
-        if (s.includes('CLASSIFICATION = ?')) {
-          const cls = params.find((_: any, i: number) => {
-            return ['matched', 'no_match'].includes(params[i]);
-          });
-          if (cls) rows = rows.filter((r: any) => r.classification === cls);
-        }
-      }
       rows.sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-      // Apply LIMIT/OFFSET
-      const limitMatch = sql.match(/LIMIT\s+(\d+)/i);
-      const offsetMatch = sql.match(/OFFSET\s+(\d+)/i);
-      const lim = limitMatch ? parseInt(limitMatch[1]) : rows.length;
-      const off = offsetMatch ? parseInt(offsetMatch[1]) : 0;
-      return rows.slice(off, off + lim) as T[];
+      const lim = sql.match(/LIMIT\s+(\d+)/i);
+      const off = sql.match(/OFFSET\s+(\d+)/i);
+      return rows.slice(off ? parseInt(off[1]) : 0, lim ? (off ? parseInt(off[1]) : 0) + parseInt(lim[1]) : undefined) as T[];
     }
     if (s.includes('FROM SYSTEM_LOGS')) {
       let rows = [...store.table('system_logs')];
       rows.sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-      const limitMatch = sql.match(/LIMIT\s+(\d+)/i);
-      const offsetMatch = sql.match(/OFFSET\s+(\d+)/i);
-      const lim = limitMatch ? parseInt(limitMatch[1]) : rows.length;
-      const off = offsetMatch ? parseInt(offsetMatch[1]) : 0;
-      return rows.slice(off, off + lim) as T[];
+      const lim = sql.match(/LIMIT\s+(\d+)/i);
+      return lim ? rows.slice(0, parseInt(lim[1])) as T[] : rows as T[];
     }
-    if (s.includes('FROM NOTIFICATIONS')) {
-      return store.table('notifications') as T[];
-    }
-
+    if (s.includes('FROM NOTIFICATIONS')) return store.table('notifications') as T[];
     return [];
   }
 }
