@@ -11,14 +11,16 @@ settingsRouter.get('/', (_req, res, next) => {
   try {
     let rows: { key: string; value: string }[] = [];
     try {
-      rows = Database.getInstance().queryAll<{ key: string; value: string }>('SELECT key, value FROM settings');
+      rows = Database.getInstance().queryAll<{ key: string; value: string }>(
+        'SELECT key, value FROM settings'
+      );
     } catch {
-      // DB unavailable — return env-based values
       rows = [
         { key: 'telegram_bot_token', value: AppConfig.telegram.botToken ? '***set***' : '' },
         { key: 'telegram_chat_id', value: AppConfig.telegram.chatId },
         { key: 'check_interval', value: String(AppConfig.monitoring.checkIntervalSeconds) },
         { key: 'monitoring_active', value: 'true' },
+        { key: 'scheduler_mode', value: process.env.SCHEDULER_MODE || 'internal' },
       ];
     }
     const out: Record<string, string> = {};
@@ -62,10 +64,13 @@ settingsRouter.post('/toggle-monitoring', (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ── Run check — called by external cron OR manually ────────
+// This is the PRIMARY trigger in external scheduler mode.
 settingsRouter.post('/run-check', async (_req, res, next) => {
   try {
     const job = new MonitoringJob();
-    job.runCheck().catch(console.error);
-    res.json({ success: true, message: 'Manual check started' });
+    // Run synchronously so the response includes results
+    const result = await job.runCheck('manual');
+    res.json({ success: true, ...result });
   } catch (e) { next(e); }
 });
