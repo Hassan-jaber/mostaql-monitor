@@ -74,3 +74,13 @@ settingsRouter.post('/run-check', async (_req, res, next) => {
     res.json({ success: true, ...result });
   } catch (e) { next(e); }
 });
+
+// Manual re-evaluation — only for unsent no_match projects (sent_at IS NULL)
+// Safe to call: will NOT resend already-notified projects
+settingsRouter.post('/re-evaluate', async (_req, res, next) => {
+  try {
+    const job = new MonitoringJob();
+    await job.reEvaluateOldProjects();
+    res.json({ success: true, message: 'Re-evaluation complete' });
+  } catch (e) { next(e); }
+});

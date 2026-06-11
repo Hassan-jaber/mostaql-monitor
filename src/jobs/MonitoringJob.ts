@@ -5,15 +5,9 @@ import { ProjectRepository } from '../repositories/ProjectRepository';
 import { Database } from '../database/Database';
 import { logger } from '../utils/logger';
 
-// ──────────────────────────────────────────────────────────────
-// SchedulerState — persisted in DB so it survives process restarts.
-// Hostinger restarts the Node process frequently; in-memory state
-// is lost. Everything important is written to the DB immediately.
-// ──────────────────────────────────────────────────────────────
 export const SchedulerState = {
   processStartTime: new Date().toISOString(),
 
-  // Write a key/value to settings table
   set(key: string, value: string): void {
     try {
       Database.getInstance().run(
@@ -50,22 +44,6 @@ export const SchedulerState = {
   },
 };
 
-// ──────────────────────────────────────────────────────────────
-// MonitoringJob
-//
-// Two modes controlled by SCHEDULER_MODE env var:
-//
-//   internal (default):
-//     Uses setInterval. Works locally and on VPS.
-//     On Hostinger shared hosting, the process may be killed —
-//     the interval dies with it. Use external mode instead.
-//
-//   external:
-//     setInterval is disabled. All checks are triggered by
-//     POST /api/settings/run-check from an external cron service
-//     (cron-job.org, UptimeRobot, GitHub Actions, etc.)
-//     This is the RECOMMENDED mode for Hostinger Business Hosting.
-// ──────────────────────────────────────────────────────────────
 export class MonitoringJob {
   private scraper = new MostaqlScraperService();
   private matcher = new KeywordMatcherService();
@@ -81,58 +59,45 @@ export class MonitoringJob {
   async start(): Promise<void> {
     const interval = this.getInterval();
 
-    // Record process start in DB
     SchedulerState.set('process_start_time', SchedulerState.processStartTime);
     SchedulerState.set('scheduler_mode', this.mode);
     SchedulerState.set('scheduler_running', 'false');
 
     logger.info(`⚙️  Scheduler mode: ${this.mode.toUpperCase()}`);
 
-    // Always run one immediate check on startup
+    // Run one immediate check on startup
     logger.info('▶️  Running immediate startup check...');
-    await this.runCheck();
+    await this.runCheck('startup');
 
     if (this.mode === 'external') {
-      logger.info('⏸  Internal scheduler DISABLED — waiting for external cron triggers');
-      logger.info('   Trigger URL: POST /api/settings/run-check');
-      logger.info('   Set up a cron job at cron-job.org or similar to call this every 60s');
+      logger.info('⏸  Internal scheduler DISABLED — use cron-job.org to POST /api/settings/run-check');
       return;
     }
 
-    // Internal mode — setInterval
     const ms = interval * 1000;
     this.timer = setInterval(async () => {
-      if (this.isRunning) {
-        logger.debug('⏭  Skipping — previous check still running');
-        return;
-      }
-      await this.runCheck();
+      if (this.isRunning) { logger.debug('⏭  Skipping — still running'); return; }
+      await this.runCheck('scheduler');
     }, ms);
 
-    // DO NOT call timer.unref() — process must stay alive
+    // DO NOT call timer.unref()
     logger.info('Monitoring timer created');
     logger.info(`Interval = ${interval}s`);
     logger.info(`✅ Internal scheduler started (every ${interval}s)`);
 
-    // Heartbeat watchdog — checks every 5 min if the timer is still alive
-    // and logs a warning if no run happened in 3× the expected interval
+    // Watchdog: log error if no run in 3× interval
     setInterval(() => {
       const last = SchedulerState.get('last_scheduler_run');
       if (!last) return;
       const diffMs = Date.now() - new Date(last).getTime();
-      const maxAllowed = interval * 3 * 1000;
-      if (diffMs > maxAllowed) {
+      if (diffMs > interval * 3 * 1000) {
         const mins = Math.round(diffMs / 60000);
-        logger.error(`🚨 SCHEDULER STALLED: no run in ${mins} minutes (expected every ${interval}s)`);
-        SchedulerState.set('scheduler_stalled', `true — last run ${mins}m ago at ${last}`);
-        Database.getInstance().run(
-          'INSERT INTO system_logs (level, category, message) VALUES (?, ?, ?)',
-          ['error', 'scheduler', `Scheduler stalled: no run in ${mins} minutes`]
-        );
+        logger.error(`🚨 SCHEDULER STALLED: no run in ${mins} minutes`);
+        SchedulerState.set('scheduler_stalled', `true — last run ${mins}m ago`);
       } else {
         SchedulerState.set('scheduler_stalled', 'false');
       }
-    }, 5 * 60 * 1000); // check every 5 minutes
+    }, 5 * 60 * 1000);
   }
 
   stop(): void {
@@ -155,37 +120,33 @@ export class MonitoringJob {
     let scanned = 0, newCount = 0, matchedCount = 0, notifiedCount = 0;
 
     try {
-      // Check pause state
       let isActive = true;
       try {
         const row = Database.getInstance().queryOne<{ value: string }>(
           "SELECT value FROM settings WHERE key = 'monitoring_active'"
         );
         isActive = row?.value !== 'false';
-      } catch { /* DB unavailable — keep running */ }
+      } catch { /* keep running */ }
 
       if (!isActive) {
-        logger.info('⏸  Monitoring paused — skipping check');
+        logger.info('⏸  Monitoring paused');
         SchedulerState.markRunEnd(0, 0, 0);
         return { scanned: 0, newCount: 0, matched: 0, notified: 0 };
       }
 
       logger.info(`🔍 [${triggeredBy.toUpperCase()}] Checking Mostaql...`);
-
       const projects = await this.scraper.fetchLatestProjects();
       scanned = projects.length;
 
       if (projects.length === 0) {
-        logger.warn('⚠️  0 projects returned — Mostaql may be blocking');
+        logger.warn('⚠️  0 projects returned');
         SchedulerState.markRunEnd(0, 0, 0);
-        Database.getInstance().run(
-          'INSERT INTO system_logs (level, category, message) VALUES (?, ?, ?)',
-          ['warn', 'scraping', '0 projects returned from Mostaql']
-        );
         return { scanned: 0, newCount: 0, matched: 0, notified: 0 };
       }
 
       for (const project of projects) {
+        // ── DUPLICATE GUARD — primary check ────────────────────
+        // Skip if project_id already exists in DB (regardless of classification or sent_at)
         let alreadyExists = false;
         try { alreadyExists = this.repo.exists(project.project_id); } catch { /* ignore */ }
         if (alreadyExists) continue;
@@ -207,6 +168,7 @@ export class MonitoringJob {
 
         matchedCount++;
 
+        // Save BEFORE sending — so if Telegram fails, we don't resend on retry
         try {
           this.repo.save({
             project_id: project.project_id, title: project.title, url: project.url,
@@ -233,13 +195,13 @@ export class MonitoringJob {
       const elapsed = Date.now() - startTime;
       logger.info(`📊 [${triggeredBy.toUpperCase()}] Done in ${elapsed}ms — scanned: ${scanned}, new: ${newCount}, matched: ${matchedCount}, notified: ${notifiedCount}`);
 
-      // Log scheduler execution to DB
-      Database.getInstance().run(
-        'INSERT INTO system_logs (level, category, message, metadata) VALUES (?, ?, ?, ?)',
-        ['info', 'scheduler',
-          `Check complete (${triggeredBy})`,
-          JSON.stringify({ scanned, newCount, matched: matchedCount, notified: notifiedCount, elapsed_ms: elapsed })]
-      );
+      try {
+        Database.getInstance().run(
+          'INSERT INTO system_logs (level, category, message, metadata) VALUES (?, ?, ?, ?)',
+          ['info', 'scheduler', `Check complete (${triggeredBy})`,
+            JSON.stringify({ scanned, newCount, matched: matchedCount, notified: notifiedCount, elapsed_ms: elapsed })]
+        );
+      } catch { /* ignore */ }
 
       SchedulerState.markRunEnd(scanned, matchedCount, notifiedCount);
       return { scanned, newCount, matched: matchedCount, notified: notifiedCount };
@@ -247,26 +209,29 @@ export class MonitoringJob {
     } catch (err: any) {
       logger.error(`❌ runCheck error: ${err.message}`);
       SchedulerState.markRunError(err.message);
-      Database.getInstance().run(
-        'INSERT INTO system_logs (level, category, message) VALUES (?, ?, ?)',
-        ['error', 'scheduler', `runCheck error: ${err.message}`]
-      );
       return { scanned: 0, newCount: 0, matched: 0, notified: 0 };
     } finally {
       this.isRunning = false;
     }
   }
 
+  // ── reEvaluateOldProjects ──────────────────────────────────
+  // FIX: now checks sent_at IS NULL to prevent duplicate notifications.
+  // Only runs on explicit call, NOT on every startup.
   async reEvaluateOldProjects(): Promise<void> {
-    logger.info('🔄 Re-evaluating old no_match projects...');
+    logger.info('🔄 Re-evaluating unsent no_match projects...');
     let old: any[] = [];
     try {
+      // CRITICAL FIX: only re-evaluate projects that were NEVER sent (sent_at IS NULL)
       old = Database.getInstance().queryAll(
-        "SELECT project_id, title, url, budget, description, skills FROM projects WHERE classification = 'no_match'"
+        `SELECT project_id, title, url, budget, description, skills
+         FROM projects
+         WHERE classification = 'no_match'
+         AND sent_at IS NULL`
       );
     } catch { logger.warn('Cannot read DB for re-evaluation'); return; }
 
-    logger.info(`Found ${old.length} no_match projects`);
+    logger.info(`Found ${old.length} unsent no_match projects`);
     let matched = 0, notified = 0;
 
     for (const row of old) {
@@ -278,6 +243,18 @@ export class MonitoringJob {
       const { matched: isMatch, keywords } = this.matcher.matchProject(project);
       if (!isMatch) continue;
       matched++;
+
+      // Double-check: skip if somehow already sent
+      try {
+        const existing = Database.getInstance().queryOne<{ sent_at: string | null }>(
+          'SELECT sent_at FROM projects WHERE project_id = ?', [project.project_id]
+        );
+        if (existing?.sent_at) {
+          logger.debug(`Skipping ${project.project_id} — already sent at ${existing.sent_at}`);
+          continue;
+        }
+      } catch { /* proceed */ }
+
       logger.info(`🔄 Re-matched: "${project.title}"`);
       try {
         Database.getInstance().run(
@@ -285,6 +262,7 @@ export class MonitoringJob {
           [`Re-matched: ${keywords.join(', ')}`, JSON.stringify(keywords), project.project_id]
         );
       } catch { /* ignore */ }
+
       const sent = await this.telegram.sendMatchNotification(project, keywords);
       if (sent) notified++;
     }
