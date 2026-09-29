@@ -1,28 +1,33 @@
-import { Database } from '../database/Database';
-import { ProjectRecord, ProjectFilter, PaginatedResult } from '../modules/types';
+import { Database, NewProjectRow, RetryableProject } from '../database/Database';
+import { ProjectRecord, ProjectFilter, PaginatedResult, NotifyStatus } from '../modules/types';
 
 export class ProjectRepository {
   private get db() { return Database.getInstance(); }
 
+  /** Throws if the database is unavailable — callers must NOT treat that as "new". */
   exists(projectId: string): boolean {
-    const row = this.db.queryOne('SELECT id FROM projects WHERE project_id = ?', [projectId]);
-    return !!row;
+    return this.db.projectExists(projectId);
   }
 
-  save(data: {
-    project_id: string; title: string; url: string; budget: string;
-    description: string; skills: string; classification: string;
-    reason: string; matched_keywords: string;
-  }): void {
-    this.db.run(`
-      INSERT OR IGNORE INTO projects
-        (project_id, title, url, budget, description, skills, classification, reason, matched_keywords)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-      data.project_id, data.title, data.url, data.budget,
-      data.description, data.skills, data.classification,
-      data.reason, data.matched_keywords,
-    ]);
+  /** Returns true if the row was inserted, false if it already existed. */
+  save(data: NewProjectRow): boolean {
+    return this.db.insertProject(data);
+  }
+
+  recordNotifyResult(projectId: string, ok: boolean, error?: string): void {
+    this.db.recordNotifyResult(projectId, ok, error);
+  }
+
+  markNotifySkipped(projectId: string, reason: string): void {
+    this.db.markNotifySkipped(projectId, reason);
+  }
+
+  getRetryable(sinceIso: string, maxAttempts: number, limit = 20): RetryableProject[] {
+    return this.db.getRetryableProjects(sinceIso, maxAttempts, limit);
+  }
+
+  updateClassification(projectId: string, classification: string, reason: string, matchedKeywords: string, notifyStatus: NotifyStatus | null): void {
+    this.db.updateProjectClassification(projectId, classification, reason, matchedKeywords, notifyStatus);
   }
 
   findById(projectId: string): ProjectRecord | null {
@@ -72,8 +77,10 @@ export class ProjectRepository {
   }
 
   getScoreDistribution(): Array<{ range: string; count: number }> {
-    const matched = Number(this.db.queryOne<any>("SELECT COUNT(*) as cnt FROM projects WHERE classification = 'matched'")?.cnt ?? 0);
-    const no_match = Number(this.db.queryOne<any>("SELECT COUNT(*) as cnt FROM projects WHERE classification = 'no_match'")?.cnt ?? 0);
-    return [{ range: 'matched', count: matched }, { range: 'no_match', count: no_match }];
+    const rows = this.db.queryAll<{ classification: string; count: number }>(
+      'SELECT classification, COUNT(*) as count FROM projects GROUP BY classification'
+    );
+    const get = (c: string) => Number(rows.find(r => r.classification === c)?.count ?? 0);
+    return [{ range: 'matched', count: get('matched') }, { range: 'no_match', count: get('no_match') }];
   }
 }

@@ -51,13 +51,7 @@ export class KeywordMatcherService {
 
   matchProject(project: ScrapedProject): { matched: boolean; keywords: string[] } {
     // Match ONLY against the project TITLE
-    const searchText = (project.title || '')
-      .toLowerCase()
-      .replace(/[\u064B-\u065F]/g, '') // Arabic diacritics
-      .replace(/\u200b/g, '')
-      .replace(/[،,]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
+    const searchText = normalizeArabic(project.title || '');
 
     const matched: string[] = [];
 
@@ -65,7 +59,7 @@ export class KeywordMatcherService {
       if (this.matchKeyword(searchText, kw.toLowerCase())) matched.push(kw);
     }
     for (const kw of KEYWORDS_AR) {
-      if (searchText.includes(kw)) matched.push(kw);
+      if (searchText.includes(normalizeArabic(kw))) matched.push(kw);
     }
 
     const unique = [...new Set(matched)];
@@ -95,4 +89,22 @@ export class KeywordMatcherService {
     }
     return stats;
   }
+}
+
+/**
+ * Lower-case + unify common Arabic spelling variants so that e.g.
+ * "منصة سله" matches "سلة" and "انشاء" matches "إنشاء".
+ */
+export function normalizeArabic(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[\u064B-\u065F\u0670]/g, '') // diacritics
+    .replace(/\u0640/g, '')                 // tatweel
+    .replace(/[\u200b-\u200f]/g, '')        // zero-width / direction marks
+    .replace(/[أإآٱ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
+    .replace(/[،,]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }

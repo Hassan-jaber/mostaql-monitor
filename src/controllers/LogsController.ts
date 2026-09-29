@@ -1,5 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { Database } from '../database/Database';
+import { requireAdmin } from '../middleware/adminAuth';
 
 export const logsRouter = Router();
 
@@ -22,7 +23,7 @@ logsRouter.get('/', (req: Request, res: Response, next: NextFunction) => {
   } catch (e) { next(e); }
 });
 
-logsRouter.delete('/', (_req, res, next) => {
+logsRouter.delete('/', requireAdmin, (_req, res, next) => {
   try {
     Database.getInstance().run(`DELETE FROM system_logs WHERE created_at < datetime('now', '-7 days')`);
     res.json({ success: true });

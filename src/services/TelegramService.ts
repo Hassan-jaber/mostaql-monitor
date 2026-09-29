@@ -1,106 +1,165 @@
 import axios from 'axios';
 import { ScrapedProject } from '../modules/types';
 import { logger } from '../utils/logger';
-import { Database } from '../database/Database';
 import { AppConfig } from '../config/AppConfig';
+import { redact, errorMessage } from '../utils/redact';
 
 // ──────────────────────────────────────────────────────────────
 // TelegramService
 //
-// CRITICAL FIX: credentials are read from AppConfig (env vars)
-// NOT from the database. This ensures notifications work even
-// if DB initialization fails on Hostinger.
-//
-// Priority: env var → DB setting → empty (fail gracefully)
+// • Credentials come ONLY from env vars (TELEGRAM_BOT_TOKEN,
+//   TELEGRAM_CHAT_ID). They are never logged, stored or returned.
+// • Messages use parse_mode=HTML with every dynamic value escaped.
+//   (v3.1 used legacy Markdown without escaping, so any title or
+//   description containing _ * [ or ` was rejected with HTTP 400
+//   "can't parse entities".)
+// • This service does not touch the database; the caller records
+//   delivery state so a failed send is never marked as sent.
 // ──────────────────────────────────────────────────────────────
+
+export interface SendResult {
+  ok: boolean;
+  error?: string;
+  /** Telegram error_code or HTTP status when available */
+  code?: number;
+}
+
+type InlineKeyboard = Array<Array<{ text: string; url: string }>>;
+
+const API = 'https://api.telegram.org';
+const MAX_LEN = 4000;
+
 export class TelegramService {
 
-  private getToken(): string {
-    // 1. Try env var first (always works, even if DB fails)
-    if (AppConfig.telegram.botToken) return AppConfig.telegram.botToken;
-    // 2. Fallback to DB setting
-    try {
-      const row = Database.getInstance().queryOne<{ value: string }>(
-        'SELECT value FROM settings WHERE key = ?', ['telegram_bot_token']
-      );
-      return row?.value || '';
-    } catch { return ''; }
+  private get token(): string { return AppConfig.telegram.botToken; }
+  private get chatId(): string { return AppConfig.telegram.chatId; }
+
+  isConfigured(): { ok: boolean; error?: string } {
+    if (!this.token || !/^\d{5,}:[A-Za-z0-9_-]{20,}$/.test(this.token)) {
+      return { ok: false, error: 'TELEGRAM_BOT_TOKEN is missing or malformed (expected "<digits>:<secret>")' };
+    }
+    if (!this.chatId) return { ok: false, error: 'TELEGRAM_CHAT_ID is missing' };
+    return { ok: true };
   }
 
-  private getChatId(): string {
-    if (AppConfig.telegram.chatId) return AppConfig.telegram.chatId;
-    try {
-      const row = Database.getInstance().queryOne<{ value: string }>(
-        'SELECT value FROM settings WHERE key = ?', ['telegram_chat_id']
-      );
-      return row?.value || '';
-    } catch { return ''; }
+  /**
+   * Send a project notification. Returns ok=true only when Telegram
+   * accepted the main message. The second "copy" message is best-effort
+   * and never causes a retry (which would duplicate the main message).
+   */
+  async sendMatchNotification(project: ScrapedProject, keywords: string[]): Promise<SendResult> {
+    const cfg = this.isConfigured();
+    if (!cfg.ok) {
+      logger.error(`❌ Telegram not configured: ${cfg.error}`);
+      return { ok: false, error: cfg.error };
+    }
+
+    const main = await this.sendMessage(this.buildInfoMessage(project, keywords), [
+      [{ text: '🔗 فتح المشروع', url: project.url }],
+    ]);
+    if (!main.ok) {
+      logger.error(`❌ Telegram send failed for ${project.project_id}: ${main.error}`);
+      return main;
+    }
+
+    const copy = await this.sendMessage(this.buildCopyMessage(project, keywords));
+    if (!copy.ok) logger.warn(`Telegram copy-message failed for ${project.project_id} (main message was delivered): ${copy.error}`);
+
+    logger.info(`✅ Telegram sent: "${project.title.slice(0, 80)}"`);
+    return { ok: true };
   }
 
-  async sendMatchNotification(project: ScrapedProject, keywords: string[]): Promise<boolean> {
-    const botToken = this.getToken();
-    const chatId = this.getChatId();
+  /** Operational alert (scraper down / recovered). */
+  async sendAlert(text: string): Promise<SendResult> {
+    const cfg = this.isConfigured();
+    if (!cfg.ok) return { ok: false, error: cfg.error };
+    return this.sendMessage(text);
+  }
 
-    logger.info(`📬 Attempting Telegram — token: ${botToken ? botToken.slice(0,8) + '***' : 'MISSING'}, chatId: ${chatId || 'MISSING'}`);
-
-    if (!botToken || botToken.length < 10) {
-      logger.error('❌ TELEGRAM_BOT_TOKEN is not set or too short. Set it as environment variable.');
-      return false;
-    }
-    if (!chatId) {
-      logger.error('❌ TELEGRAM_CHAT_ID is not set. Set it as environment variable.');
-      return false;
-    }
-
-    const infoMsg = this.buildInfoMessage(project, keywords);
-    const copyMsg = this.buildCopyMessage(project, keywords);
+  async testConnection(): Promise<{ success: boolean; status: string; info?: string; error?: string }> {
+    const cfg = this.isConfigured();
+    if (!cfg.ok) return { success: false, status: 'TELEGRAM_NOT_CONFIGURED', error: cfg.error };
 
     try {
-      // Message 1: project info + open button
-      await this.sendMessage(botToken, chatId, infoMsg, [
-        [{ text: '🔗 فتح المشروع', url: project.url }],
-      ]);
-
-      // Message 2: copyable code block
-      await this.sendMessage(botToken, chatId, copyMsg);
-
-      // Record in DB (non-fatal if fails)
-      try {
-        Database.getInstance().run(
-          `INSERT INTO notifications (project_id, telegram_status, sent_at) VALUES (?, 'sent', datetime('now'))`,
-          [project.project_id]
-        );
-        Database.getInstance().run(
-          `UPDATE projects SET sent_at = datetime('now') WHERE project_id = ?`,
-          [project.project_id]
-        );
-      } catch { /* DB write failure is non-fatal */ }
-
-      logger.info(`✅ Telegram sent: "${project.title}"`);
-      return true;
-
-    } catch (err: any) {
-      const msg = err?.response?.data?.description || err?.response?.data || err.message || 'unknown';
-      logger.error(`❌ Telegram API error: ${JSON.stringify(msg)}`);
-      try {
-        Database.getInstance().run(
-          `INSERT INTO notifications (project_id, telegram_status, error_message) VALUES (?, 'failed', ?)`,
-          [project.project_id, String(msg)]
-        );
-      } catch { /* ignore */ }
-      return false;
+      const r = await axios.get(`${API}/bot${this.token}/getMe`, { timeout: 8000, validateStatus: () => true });
+      if (!r.data?.ok) {
+        return { success: false, status: 'TELEGRAM_FAILED', error: this.describeApiError(r.status, r.data) };
+      }
+      const bot = r.data.result;
+      const sent = await this.sendMessage('✅ <b>Mostaql Monitor</b> — Telegram connection test successful.');
+      if (!sent.ok) {
+        return { success: false, status: 'TELEGRAM_FAILED', error: `Bot @${bot.username} is valid, but sending to the chat failed: ${sent.error}` };
+      }
+      return { success: true, status: 'SUCCESS', info: `@${bot.username} — test message delivered` };
+    } catch (e: any) {
+      return { success: false, status: 'TELEGRAM_FAILED', error: errorMessage(e) };
     }
   }
+
+  // ── Low-level send with one 429 retry ──────────────────────
+
+  private async sendMessage(text: string, keyboard?: InlineKeyboard): Promise<SendResult> {
+    const parts = text.length <= MAX_LEN ? [text] : this.splitText(text, MAX_LEN);
+
+    for (let i = 0; i < parts.length; i++) {
+      const body: Record<string, unknown> = {
+        chat_id: this.chatId,
+        text: parts[i],
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+      };
+      if (i === parts.length - 1 && keyboard) body.reply_markup = { inline_keyboard: keyboard };
+
+      let res = await this.post(body);
+      if (!res.ok && res.code === 429 && res.retryAfter && res.retryAfter <= 15) {
+        await new Promise(r => setTimeout(r, res.retryAfter! * 1000));
+        res = await this.post(body);
+      }
+      if (!res.ok) return { ok: false, error: res.error, code: res.code };
+    }
+    return { ok: true };
+  }
+
+  private async post(body: Record<string, unknown>): Promise<SendResult & { retryAfter?: number }> {
+    try {
+      const r = await axios.post(`${API}/bot${this.token}/sendMessage`, body, {
+        timeout: AppConfig.telegram.timeoutMs,
+        validateStatus: () => true,
+      });
+      if (r.data?.ok) return { ok: true };
+      return {
+        ok: false,
+        code: r.data?.error_code ?? r.status,
+        error: this.describeApiError(r.status, r.data),
+        retryAfter: r.data?.parameters?.retry_after,
+      };
+    } catch (e: any) {
+      const timedOut = e?.code === 'ECONNABORTED' || /timeout/i.test(e?.message || '');
+      return { ok: false, error: timedOut ? `Telegram timeout after ${AppConfig.telegram.timeoutMs}ms` : errorMessage(e) };
+    }
+  }
+
+  private describeApiError(status: number, data: any): string {
+    const desc = redact(data?.description || `HTTP ${status}`);
+    const code = data?.error_code ?? status;
+    if (code === 401) return `401 Unauthorized — TELEGRAM_BOT_TOKEN is invalid or revoked (${desc})`;
+    if (code === 403) return `403 Forbidden — bot was blocked or removed from the chat (${desc})`;
+    if (code === 400 && /chat not found/i.test(desc)) return `400 chat not found — check TELEGRAM_CHAT_ID and that you pressed Start in the bot chat`;
+    if (code === 429) return `429 Too Many Requests (${desc})`;
+    return `${code} ${desc}`;
+  }
+
+  // ── Message builders (HTML, escaped) ───────────────────────
 
   private buildInfoMessage(project: ScrapedProject, keywords: string[]): string {
     const description = (project.description || '').trim().slice(0, 400);
     const kwLine = keywords.slice(0, 6).join(', ');
-    let msg = `🚀 مشروع Front-End جديد على مستقل\n\n`;
-    msg += `📌 العنوان:\n${project.title}\n\n`;
-    msg += `💰 الميزانية: ${project.budget || 'غير محدد'}\n\n`;
-    if (description) msg += `📝 الوصف:\n${description}\n\n`;
-    msg += `🎯 الكلمات المطابقة: ${kwLine}\n\n`;
-    msg += `🔗 ${project.url}`;
+    let msg = `🚀 <b>مشروع Front-End جديد على مستقل</b>\n\n`;
+    msg += `📌 <b>العنوان:</b>\n${esc(project.title)}\n\n`;
+    msg += `💰 <b>الميزانية:</b> ${esc(project.budget || 'غير محدد')}\n\n`;
+    if (description) msg += `📝 <b>الوصف:</b>\n${esc(description)}\n\n`;
+    msg += `🎯 <b>الكلمات المطابقة:</b> ${esc(kwLine)}\n\n`;
+    msg += `🔗 ${esc(project.url)}`;
     return msg;
   }
 
@@ -113,35 +172,7 @@ export class TelegramService {
     if (description) content += `📝 الوصف:\n${description}\n`;
     content += `🎯 الكلمات المطابقة: ${kwLine}\n`;
     content += `🔗 ${project.url}`;
-    return `📋 اضغط على النص أدناه لنسخه:\n\`\`\`\n${content}\n\`\`\``;
-  }
-
-  private async sendMessage(
-    token: string,
-    chatId: string,
-    text: string,
-    inlineKeyboard?: Array<Array<{ text: string; url?: string }>>
-  ): Promise<void> {
-    const MAX = 4000;
-    const parts = text.length <= MAX ? [text] : this.splitText(text, MAX);
-
-    for (let i = 0; i < parts.length; i++) {
-      const isLast = i === parts.length - 1;
-      const body: Record<string, unknown> = {
-        chat_id: chatId,
-        text: parts[i],
-        parse_mode: 'Markdown',
-        disable_web_page_preview: true,
-      };
-      if (isLast && inlineKeyboard) {
-        body.reply_markup = { inline_keyboard: inlineKeyboard };
-      }
-      await axios.post(
-        `https://api.telegram.org/bot${token}/sendMessage`,
-        body,
-        { timeout: 15000 }
-      );
-    }
+    return `📋 اضغط على النص أدناه لنسخه:\n<pre>${esc(content)}</pre>`;
   }
 
   private splitText(text: string, max: number): string[] {
@@ -156,27 +187,9 @@ export class TelegramService {
     if (rem) parts.push(rem);
     return parts;
   }
+}
 
-  async testConnection(): Promise<{ success: boolean; info?: string; error?: string }> {
-    const token = this.getToken();
-    const chatId = this.getChatId();
-
-    if (!token) return { success: false, error: 'TELEGRAM_BOT_TOKEN not set in environment variables' };
-    if (!chatId) return { success: false, error: 'TELEGRAM_CHAT_ID not set in environment variables' };
-
-    try {
-      const r = await axios.get(`https://api.telegram.org/bot${token}/getMe`, { timeout: 8000 });
-      const bot = r.data?.result;
-
-      // Send test message
-      await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
-        chat_id: chatId,
-        text: '✅ Mostaql Monitor — Telegram connection test successful!',
-      }, { timeout: 8000 });
-
-      return { success: true, info: `@${bot.username} — test message sent to ${chatId}` };
-    } catch (e: any) {
-      return { success: false, error: e?.response?.data?.description || e.message };
-    }
-  }
+/** Escape for Telegram parse_mode=HTML. */
+export function esc(s: string): string {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
